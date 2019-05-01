@@ -6,12 +6,15 @@ import scala.meta.Decl
 import scala.meta.Defn
 import scala.meta.Mod
 import scala.meta.Import
+import scala.meta.Importer
 import scala.meta.Pkg
 import scala.meta.Term
 import scala.meta.Tree
+import scala.meta.Type
 import scala.meta.prettyprinters.Syntax
 import scala.meta.tokens.Token
 import scala.meta.tokens.Token._
+import scala.meta.internal.platform
 import java.util.regex.Pattern
 
 import org.scalafmt.internal.FormatWriter.FormatLocation
@@ -30,20 +33,34 @@ class FormatWriter(formatOps: FormatOps) {
     val sb = new StringBuilder()
     var lastState = State.start // used to calculate start of formatToken.right.
     reconstructPath(tokens, splits, debug = false) {
-      case (state, formatToken, whitespace) =>
+      case (state, formatToken, whitespace, tokenAligns) =>
         formatToken.left match {
           case c: Comment =>
             sb.append(formatComment(c, state.indentation))
           case token @ Interpolation.Part(_) =>
             sb.append(formatMarginizedString(token, state.indentation))
-          case literal @ Constant.String(_) => // Ignore, see below.
+          case Constant.String(_) => // Ignore, see below.
+          case c: Constant.Long =>
+            sb.append(initStyle.literals.long.process(c.syntax))
+          case c: Constant.Float =>
+            sb.append(initStyle.literals.float.process(c.syntax))
+          case c: Constant.Double =>
+            sb.append(initStyle.literals.double.process(c.syntax))
           case token =>
             val rewrittenToken =
               formatOps.initStyle.rewriteTokens
                 .getOrElse(token.syntax, token.syntax)
             sb.append(rewrittenToken)
         }
-        sb.append(whitespace)
+
+        handleTrailingCommasAndWhitespace(
+          formatToken,
+          state,
+          sb,
+          whitespace,
+          tokenAligns
+        )
+
         formatToken.right match {
           // state.column matches the end of formatToken.right
           case literal: Constant.String =>
@@ -63,8 +80,90 @@ class FormatWriter(formatOps: FormatOps) {
     trailingSpace.matcher(str).replaceAll("")
   }
 
-  val leadingAsteriskSpace =
-    Pattern.compile("\n *\\*(?!\\*)", Pattern.MULTILINE)
+
+  // This is the same set as the Java "\h" pre-defined character class.
+  // "\h" is not used because Scala Native does not support it.
+  private val horizontalWhiteSpace =
+    """[\x20\t\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]"""
+
+  // LeeT - a bold person could change the whitespace handling on
+  // if branch. A bolder person could change trailingSpace &
+  // leadingPipeSpace.
+
+  // The "\n" in both patterns below should be a "^" caret
+  // beginning-of-line anchor. Java & Scala Native 0.4.0 support
+  // anchors. SN 0.3.x does not. I am not sure what scalaJs supports.
+  // "\n" works, just adds conceptual overhead.
+
+/*
+// Production version
+  val leadingAsteriskSpace = Pattern.compile(
+    if (platform.isJVM || platform.isJS) "\n *\\*(?!\\*)"
+    else s"\n${horizontalWhiteSpace}*" + """\*\*?""",
+    Pattern.MULTILINE
+  )
+*/
+
+// Hacked for testing
+  val leadingAsteriskSpace = Pattern.compile(
+    s"\n${horizontalWhiteSpace}*" + """\*\*?""",
+    Pattern.MULTILINE
+  )
+
+  private def snFormatComment(syntax: String,
+			      compiled: Pattern,
+			      spaces: String): String = {
+
+    // The code in this method is sensitive to _any_ change, including
+    // changes in temperature and/or wind speed & direction. Devo BEWARE!
+    //
+    // It works around the designed and documented lack of
+    // regex lookaround (?!) in ScalaNative.
+    //
+    // It also works around two SN specific issues.
+    //    1) SN 0.3.x appears to not support replacements which
+    //       try to access a found group (e.g.: $1, etc.). SN 0.4.0
+    //       appears to allow this.
+    //    2) SN 0.3.x appears to have a bug in Character#charAt.
+    //       I believe this bug does not occur in SN 0.4.0.
+
+    // Follow the find & replace model at Java documentation URL:
+    // https://docs.oracle.com/javase/8/docs/api/java/util/regex/Matcher.html
+    // This code should approximate the execution speed of
+    // m.replaceAll because it uses essentiall the same algotithm.
+
+    val m = compiled.matcher(syntax)
+
+    // StringBuffer easier to work with in Scala Native
+    val sb = new StringBuffer(syntax.length)
+
+    while (m.find) {
+
+      // BUG ALERT:
+      // One would expect the 'if (!matched.endsWith("**")' fragment below
+      // to be more efficiently coded as a single character access:
+      //
+      // val matchedLength = matched.length
+      // if (! ((matchedLength >= 2) && (matched(matchedLength - 2) == '*')))
+      // 
+      // Unfortunately, there appears to be a bug in SN which prevents this.
+      // The second clause becomes Character#charAt and throws an
+      // indexOutOfBoundsException where it should not.
+      // I believe that SN 0.4.0 does not have this bug.
+
+      // Design note - Behavior required by Scalafmt FormatTests:
+      //     Pass double colon comment through unchanged. Scalafmt Issue #384.
+      //     regex will have passed over blank lines.
+
+      val matched = m.group
+      if (!matched.endsWith("**")){
+        m.appendReplacement(sb, s"\n${spaces}*" )
+      }
+    }
+
+    m.appendTail(sb).toString
+  }
+
   private def formatComment(comment: Comment, indent: Int): String = {
     val alignedComment =
       if (comment.syntax.startsWith("/*") &&
@@ -73,9 +172,27 @@ class FormatWriter(formatOps: FormatOps) {
         val spaces: String =
           if (isDocstring && initStyle.scalaDocs) " " * (indent + 2)
           else " " * (indent + 1)
+
+        // LeeT - a bold person could calculate the replacement once
+        // and use it on both branches.  The "\\" on the JVM/Js
+        // path is not wrong, but rather unneeded.  It is, however,
+        // well honored by existing use.
+
+
+// platform.isNative appears not to exist in JS build.
+//        if (!platform.isNative)
+
+//    if (platform.isJVM || platform.isJS) {
+// FormatTests runs on JVM (only?) so, for testing & development,
+// always use the snFormatCommentCode, to see if it passes.
+        
+        if (false) {
         leadingAsteriskSpace
           .matcher(comment.syntax)
           .replaceAll(s"\n$spaces\\*")
+        } else {// should probably be robust and be 'if platform.isNative'
+          snFormatComment(comment.syntax, leadingAsteriskSpace, spaces)
+        }
       } else {
         comment.syntax
       }
@@ -92,7 +209,8 @@ class FormatWriter(formatOps: FormatOps) {
           (for {
             parent <- owners(token).parent
             firstInterpolationPart <- parent.tokens.find(
-              _.is[Interpolation.Part])
+              _.is[Interpolation.Part]
+            )
             char <- firstInterpolationPart.syntax.headOption
           } yield char).getOrElse(' ')
         case _ =>
@@ -112,7 +230,8 @@ class FormatWriter(formatOps: FormatOps) {
   def getFormatLocations(
       toks: Array[FormatToken],
       splits: Vector[Split],
-      debug: Boolean): Array[FormatLocation] = {
+      debug: Boolean
+  ): Array[FormatLocation] = {
     require(toks.length >= splits.length, "splits !=")
     val statesBuilder = Array.newBuilder[FormatLocation]
     statesBuilder.sizeHint(toks.length)
@@ -126,7 +245,8 @@ class FormatWriter(formatOps: FormatOps) {
         if (debug && tokens.length < 1000) {
           val left = cleanup(tok.left).slice(0, 15)
           logger.debug(
-            f"$left%-15s $split ${currState.indentation} ${currState.column}")
+            f"$left%-15s $split ${currState.indentation} ${currState.column}"
+          )
         }
     }
     statesBuilder.result()
@@ -139,10 +259,13 @@ class FormatWriter(formatOps: FormatOps) {
   def reconstructPath(
       toks: Array[FormatToken],
       splits: Vector[Split],
-      debug: Boolean)(callback: (State, FormatToken, String) => Unit): Unit = {
+      debug: Boolean
+  )(
+      callback: (State, FormatToken, String, Map[FormatToken, Int]) => Unit
+  ): Unit = {
     require(toks.length >= splits.length, "splits !=")
     val locations = getFormatLocations(toks, splits, debug)
-    val tokenAligns = alignmentTokens(locations).withDefaultValue(0)
+    val tokenAligns = alignmentTokens(locations)
     var lastModification = locations.head.split.modification
     locations.zipWithIndex.foreach {
       case (FormatLocation(tok, split, state), i) =>
@@ -150,9 +273,10 @@ class FormatWriter(formatOps: FormatOps) {
         val whitespace = split.modification match {
           case Space =>
             val previousAlign =
-              if (lastModification == NoSplit) tokenAligns(prev(tok))
+              if (lastModification == NoSplit)
+                tokenAligns.getOrElse(prev(tok), 0)
               else 0
-            " " + (" " * (tokenAligns(tok) + previousAlign))
+            " " + (" " * (tokenAligns.getOrElse(tok, 0) + previousAlign))
           case nl: NewlineT
               if nl.acceptNoSplit && !tok.left.isInstanceOf[Comment] &&
                 state.indentation >= previous.state.column =>
@@ -174,7 +298,7 @@ class FormatWriter(formatOps: FormatOps) {
           case NoSplit => ""
         }
         lastModification = split.modification
-        callback.apply(state, tok, whitespace)
+        callback.apply(state, tok, whitespace, tokenAligns)
     }
     if (debug) {
 
@@ -207,7 +331,8 @@ class FormatWriter(formatOps: FormatOps) {
 
   private def isMultilineTopLevelStatement(
       toks: Array[FormatLocation],
-      i: Int): Boolean = {
+      i: Int
+  ): Boolean = {
     @tailrec def isMultiline(end: Token, i: Int): Boolean = {
       if (i >= toks.length || toks(i).formatToken.left == end) false
       else if (toks(i).split.modification.isNewline) true
@@ -267,17 +392,25 @@ class FormatWriter(formatOps: FormatOps) {
   private def columnsMatch(
       a: Array[FormatLocation],
       b: Array[FormatLocation],
-      endOfLine: FormatToken): Int = {
+      endOfLine: FormatToken
+  ): Int = {
     val result = a.zip(b).takeWhile {
       case (row1, row2) =>
-        val row2Owner = getAlignOwner(row2.formatToken)
-        val row1Owner = getAlignOwner(row1.formatToken)
-        def sameLengthToRoot =
-          vAlignDepth(row1Owner) == vAlignDepth(row2Owner)
-        key(row1.formatToken.right) == key(row2.formatToken.right) &&
-        sameLengthToRoot && {
-          val eofParents = parents(owners(endOfLine.right))
-          !(eofParents.contains(row1Owner) || eofParents.contains(row2Owner))
+        // skip checking if row1 and row2 matches if both of them continues to a single line of comment
+        // in order to vertical align adjacent single lines of comment.
+        // see: https://github.com/scalameta/scalafmt/issues/1242
+        if (isSingleLineComment(row1.formatToken.right) &&
+          isSingleLineComment(row2.formatToken.right)) true
+        else {
+          val row2Owner = getAlignOwner(row2.formatToken)
+          val row1Owner = getAlignOwner(row1.formatToken)
+          def sameLengthToRoot =
+            vAlignDepth(row1Owner) == vAlignDepth(row2Owner)
+          key(row1.formatToken.right) == key(row2.formatToken.right) &&
+          sameLengthToRoot && {
+            val eofParents = parents(owners(endOfLine.right))
+            !(eofParents.contains(row1Owner) || eofParents.contains(row2Owner))
+          }
         }
     }
     result.length
@@ -290,7 +423,8 @@ class FormatWriter(formatOps: FormatOps) {
   // TODO(olafur) Refactor implementation to make it maintainable. It's super
   // imperative and error-prone right now.
   def alignmentTokens(
-      locations: Array[FormatLocation]): Map[FormatToken, Int] = {
+      locations: Array[FormatLocation]
+  ): Map[FormatToken, Int] = {
     if (initStyle.align.tokens.isEmpty || locations.length != tokens.length)
       Map.empty[FormatToken, Int]
     else {
@@ -363,6 +497,124 @@ class FormatWriter(formatOps: FormatOps) {
       finalResult.result()
     }
   }
+
+  import scala.meta.internal.classifiers.classifier
+
+  @classifier
+  trait CloseDelim
+  object CloseDelim {
+    def unapply(token: Token): Boolean =
+      token.is[RightParen] || token.is[RightBracket] || token.is[RightBrace]
+  }
+
+  private def handleTrailingCommasAndWhitespace(
+      formatToken: FormatToken,
+      state: State,
+      sb: StringBuilder,
+      whitespace: String,
+      tokenAligns: Map[FormatToken, Int]
+  ): Unit = {
+
+    import org.scalafmt.config.TrailingCommas
+
+    val owner = owners(formatToken.right)
+    if (!runner.dialect.allowTrailingCommas ||
+      !isImporterOrDefnOrCallSite(owner)) {
+      sb.append(whitespace)
+      return
+    }
+
+    val left = formatToken.left
+    val right = nextNonComment(formatToken).right
+    val isNewline = state.splits.last.modification.isNewline
+    val prevFormatToken = prev(formatToken)
+
+    initStyle.trailingCommas match {
+      // foo(
+      //   a,
+      //   b
+      // )
+      //
+      // Insert a comma after b
+      case TrailingCommas.always
+          if !left.is[Comma] &&
+            !left.is[Comment] &&
+            !left.is[LeftParen] && // skip empty parentheses
+            !formatToken.right.is[Comment] &&
+            right.is[CloseDelim] && isNewline =>
+        sb.append(",")
+        sb.append(whitespace)
+
+      // foo(
+      //   a,
+      //   b // comment
+      // )
+      //
+      // Insert a comma after b (before comment)
+      case TrailingCommas.always
+          if left.is[Comment] && !prevFormatToken.left.is[Comma] &&
+            !prevFormatToken.left.is[Comment] &&
+            !prevNonComment(formatToken).left
+              .is[LeftParen] && // skip empty parentheses
+            right.is[CloseDelim] && isNewline =>
+        val indexOfComment = sb.lastIndexOf(left.syntax)
+        val index = sb.lastIndexOf(prevFormatToken.left.syntax, indexOfComment)
+
+        // If the leading comment is vertically aligned, preserve the location of
+        // the comment to avoid breaking the alignment.
+        if (tokenAligns.get(prevFormatToken).isDefined) {
+          sb.setCharAt(index + prevFormatToken.left.syntax.length, ',')
+        } else {
+          sb.insert(index + prevFormatToken.left.syntax.length, ",")
+        }
+        sb.append(whitespace)
+
+      // foo(
+      //   a,
+      //   b,
+      // )
+      //
+      // Remove the comma after b
+      case TrailingCommas.never
+          if left.is[Comma] && right.is[CloseDelim] &&
+            !formatToken.right.is[Comment] && isNewline =>
+        sb.deleteCharAt(sb.length - 1)
+        sb.append(whitespace)
+
+      // foo(
+      //   a,
+      //   b, // comment
+      // )
+      //
+      // Remove the comma after b (before comment)
+      case TrailingCommas.never
+          if left.is[Comment] && prevFormatToken.left.is[Comma] &&
+            right.is[CloseDelim] && isNewline =>
+        val indexOfComment = sb.lastIndexOf(left.syntax)
+        val indexOfComma =
+          sb.lastIndexOf(prevFormatToken.left.syntax, indexOfComment)
+
+        // If the leading comment is vertically aligned, preserve the location of
+        // the comment to avoid breaking the alignment.
+        if (tokenAligns.get(prevFormatToken).isDefined) {
+          sb.setCharAt(indexOfComma, ' ')
+        } else {
+          sb.deleteCharAt(indexOfComma)
+        }
+        sb.append(whitespace)
+
+      // foo(a, b,)
+      //
+      // Remove the comma after b
+      case _
+          if left.is[Comma] && right.is[CloseDelim] &&
+            !next(formatToken).left.is[Comment] && !isNewline =>
+        sb.deleteCharAt(sb.length - 1)
+
+      case _ => sb.append(whitespace)
+    }
+
+  }
 }
 
 object FormatWriter {
@@ -370,5 +622,6 @@ object FormatWriter {
   case class FormatLocation(
       formatToken: FormatToken,
       split: Split,
-      state: State)
+      state: State
+  )
 }
